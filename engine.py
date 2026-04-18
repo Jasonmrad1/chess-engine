@@ -77,6 +77,7 @@ Usage
 from __future__ import annotations
  
 import argparse
+import heapq
 import math
 import os
 import random
@@ -294,6 +295,25 @@ RAZOR_MARGINS    = [0, 190, 340, 510]         # indexed by depth 0-3
  
 # SEE piece values (simplified, fast)
 SEE_VALS = [0, 100, 300, 300, 500, 950, 20000, 0]
+
+# Root safety tuning
+ROOT_SAFETY_CANDIDATES = 12
+ROOT_SAFETY_SWITCH_MARGIN = 70
+ROOT_EMERGENCY_PENALTY = 220
+
+# Search speed tuning
+EVAL_CACHE_MAX_ENTRIES = 200_000
+HANGING_CACHE_MAX_ENTRIES = 120_000
+STAGED_ORDERING_MIN_MOVES = 10
+STAGED_QUIET_HEAD = 8
+PROBCUT_CANDIDATE_LIMIT = 6
+SINGULAR_EXCLUDE_LIMIT = 8
+
+QS_SEE_FLOOR = -100
+QS_DELTA_MARGIN = 280
+QS_CHECK_PLY_LIMIT = 1
+QS_CHECK_MAX_MOVES = 2
+QS_CHECK_MARGIN = 90
  
 # ──────────────────────────────────────────────────────────────────────────
 # Built-in opening book
@@ -470,6 +490,10 @@ class Engine:
         self.counter:   Dict[Tuple[int, int], chess.Move] = {}
         self.cont_hist: Dict[Tuple, int] = {}
         self.corr_hist: Dict[Tuple, int] = {}   # correction history
+        self.eval_cache: Dict[Hashable, int] = {}
+        self.max_eval_cache_entries = EVAL_CACHE_MAX_ENTRIES
+        self.hanging_cache: Dict[Tuple[Hashable, chess.Color], int] = {}
+        self.max_hanging_cache_entries = HANGING_CACHE_MAX_ENTRIES
  
         # Stats
         self.nodes       = 0
@@ -487,6 +511,8 @@ class Engine:
     def set_hash_size(self, entries: int):
         self.max_tt_entries = max(10_000, entries)
         self.tt.clear()
+        self.eval_cache.clear()
+        self.hanging_cache.clear()
  
     def set_syzygy_path(self, path: str):
         if path and os.path.isdir(path):
@@ -506,6 +532,8 @@ class Engine:
         normalized = str(mode).strip().lower()
         if normalized not in {"full", "fast"}:
             raise ValueError("eval mode must be 'full' or 'fast'")
+        if self.eval_mode != normalized:
+            self.eval_cache.clear()
         self.eval_mode = normalized
  
     # ── Opening book ──────────────────────────────────────────────────
@@ -639,6 +667,105 @@ class Engine:
             gain_list[i] = -max(-gain_list[i], gain_list[i + 1])
 
         return gain_list[0]
+
+    def _see_cached(self, board: chess.Board, move: chess.Move,
+                    cache: Optional[Dict[chess.Move, int]] = None) -> int:
+        if cache is None:
+            return self._see(board, move)
+        if move in cache:
+            return cache[move]
+        val = self._see(board, move)
+        cache[move] = val
+        return val
+
+    def _allows_mate_in_one_for_side_to_move(self, board: chess.Board) -> bool:
+        for move in board.legal_moves:
+            board.push(move)
+            try:
+                if board.is_checkmate():
+                    return True
+            finally:
+                board.pop()
+        return False
+
+    def _root_tactical_penalty(self, board: chess.Board) -> int:
+        """
+        Estimate immediate tactical danger after our root move.
+
+        Expects `board` with opponent to move.
+        """
+        if self._allows_mate_in_one_for_side_to_move(board):
+            return 10_000
+
+        best_opp_threat = 0
+        victim_king = board.king(not board.turn)
+        for move in board.legal_moves:
+            is_cap = board.is_capture(move)
+            gives_chk = board.gives_check(move)
+            if not is_cap and not gives_chk:
+                continue
+
+            threat = 0
+            if is_cap:
+                threat = max(threat, self._see(board, move))
+
+            if gives_chk:
+                # Forcing checks are dangerous even when SEE is neutral/negative.
+                check_threat = 120
+                if is_cap:
+                    check_threat += self._captured_value(board, move)
+
+                attacker = board.piece_at(move.from_square)
+                if attacker and attacker.piece_type in (chess.QUEEN, chess.ROOK):
+                    check_threat += 40
+                if victim_king is not None and chess.square_distance(move.to_square, victim_king) <= 1:
+                    check_threat += 40
+
+                threat = max(threat, check_threat)
+
+            if threat > best_opp_threat:
+                best_opp_threat = threat
+
+        if best_opp_threat >= 900:
+            return 320
+        if best_opp_threat >= 500:
+            return 200
+        if best_opp_threat >= 320:
+            return 140
+        if best_opp_threat >= 220:
+            return 90
+        if best_opp_threat >= 150:
+            return 60
+        if best_opp_threat >= 100:
+            return 40
+        return 0
+
+    def _pick_emergency_root_move(self, board: chess.Board) -> Optional[chess.Move]:
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            return None
+
+        best_move = legal_moves[0]
+        best_score = -INF
+
+        for move in legal_moves:
+            board.push(move)
+            try:
+                if board.is_checkmate():
+                    return move
+
+                tactical_penalty = self._root_tactical_penalty(board)
+                # After push(), board.turn is opponent; negate to score from our side.
+                static_score = -self._eval_stm(board)
+                emergency_score = static_score - tactical_penalty
+            finally:
+                board.pop()
+
+            if emergency_score > best_score:
+                best_score = emergency_score
+                best_move = move
+
+        return best_move
  
     # ── Evaluation helpers ────────────────────────────────────────────
     def _pawn_attacks(self, board: chess.Board, color: chess.Color) -> int:
@@ -648,11 +775,15 @@ class Engine:
         else:
             return ((pawns >> 7) & ~chess.BB_FILE_A) | ((pawns >> 9) & ~chess.BB_FILE_H)
  
-    def _pawn_structure_score(self, board: chess.Board, color: chess.Color, phase: int) -> int:
-        pawns = list(board.pieces(chess.PAWN, color))
+    def _pawn_structure_score(self, board: chess.Board, color: chess.Color, phase: int,
+                              pawns: Optional[List[chess.Square]] = None,
+                              enemy_pawns: Optional[List[chess.Square]] = None) -> int:
+        if pawns is None:
+            pawns = list(board.pieces(chess.PAWN, color))
         if not pawns:
             return 0
-        enemy_pawns   = list(board.pieces(chess.PAWN, not color))
+        if enemy_pawns is None:
+            enemy_pawns = list(board.pieces(chess.PAWN, not color))
         file_counts   = [0] * 8
         own_by_file   = [[] for _ in range(8)]
         enemy_by_file = [[] for _ in range(8)]
@@ -732,34 +863,46 @@ class Engine:
         return score
  
     def _knight_outpost_score(self, board: chess.Board, color: chess.Color) -> int:
-        score       = 0
-        own_pawns   = board.pieces(chess.PAWN, color)
+        score = 0
+        own_pawns = board.pieces(chess.PAWN, color)
+        enemy_pawns = list(board.pieces(chess.PAWN, not color))
+        own_pawn_set = set(own_pawns)
+        enemy_ranks_by_file = [[] for _ in range(8)]
+        for ep in enemy_pawns:
+            enemy_ranks_by_file[chess.square_file(ep)].append(chess.square_rank(ep))
+
         outpost_mask = OUTPOST_RANKS_W if color == chess.WHITE else OUTPOST_RANKS_B
         for sq in board.pieces(chess.KNIGHT, color):
             if not (chess.BB_SQUARES[sq] & outpost_mask):
                 continue
             f = chess.square_file(sq)
             r = chess.square_rank(sq)
+
             enemy_can_attack = False
             for ef in (f-1, f+1):
                 if not (0 <= ef <= 7):
                     continue
-                for ep in board.pieces(chess.PAWN, not color):
-                    if chess.square_file(ep) != ef:
-                        continue
-                    er = chess.square_rank(ep)
-                    if (color == chess.WHITE and er < r) or (color == chess.BLACK and er > r):
-                        enemy_can_attack = True; break
+                ranks = enemy_ranks_by_file[ef]
+                if color == chess.WHITE:
+                    if any(er < r for er in ranks):
+                        enemy_can_attack = True
+                        break
+                else:
+                    if any(er > r for er in ranks):
+                        enemy_can_attack = True
+                        break
                 if enemy_can_attack:
                     break
             if enemy_can_attack:
                 continue
-            supported = any(
-                0 <= af <= 7 and chess.square_file(op) == af and
-                ((color == chess.WHITE and chess.square_rank(op) == r - 1) or
-                 (color == chess.BLACK and chess.square_rank(op) == r + 1))
-                for af in (f-1, f+1) for op in own_pawns
-            )
+
+            support_rank = r - 1 if color == chess.WHITE else r + 1
+            supported = False
+            if 0 <= support_rank <= 7:
+                left_support = (f > 0 and chess.square(f - 1, support_rank) in own_pawn_set)
+                right_support = (f < 7 and chess.square(f + 1, support_rank) in own_pawn_set)
+                supported = left_support or right_support
+
             score += 32 if supported else 16
         return score
  
@@ -848,13 +991,13 @@ class Engine:
                 if not (own_p & fm) and (heavy & fm): score -= 16
  
             # Pawn storm
-            for ef in range(max(0, fi-2), min(8, fi+3)):
-                for ep in board.pieces(chess.PAWN, not color):
-                    if chess.square_file(ep) != ef: continue
-                    er   = chess.square_rank(ep)
-                    dist = er - ri if color == chess.WHITE else ri - er
-                    if 0 < dist <= 4:
-                        score -= (5 - dist) * 7
+            for ep in enemy_p:
+                if abs(chess.square_file(ep) - fi) > 2:
+                    continue
+                er = chess.square_rank(ep)
+                dist = er - ri if color == chess.WHITE else ri - er
+                if 0 < dist <= 4:
+                    score -= (5 - dist) * 7
  
             # Heavy piece proximity
             for sq in board.pieces(chess.QUEEN, not color):
@@ -872,6 +1015,11 @@ class Engine:
  
     def _hanging_pieces_score(self, board: chess.Board, color: chess.Color) -> int:
         """Penalty for undefended pieces attacked by enemy."""
+        hk = (self._tt_key(board), color)
+        cached = self.hanging_cache.get(hk)
+        if cached is not None:
+            return cached
+
         score = 0
         enemy = not color
         for sq in chess.scan_forward(board.occupied_co[color]):
@@ -880,6 +1028,10 @@ class Engine:
                 continue
             if board.is_attacked_by(enemy, sq) and not board.is_attacked_by(color, sq):
                 score -= PIECE_VALUES[piece.piece_type] // 6
+
+        if len(self.hanging_cache) >= self.max_hanging_cache_entries:
+            self.hanging_cache.clear()
+        self.hanging_cache[hk] = score
         return score
  
     def _endgame_knowledge(self, board: chess.Board) -> int:
@@ -955,18 +1107,30 @@ class Engine:
         phase      = min(phase, TOTAL_PHASE)
         base_score = (mg * phase + eg * (TOTAL_PHASE - phase)) // TOTAL_PHASE
         score      = base_score
+
+        white_pawns_bb = board.pieces(chess.PAWN, chess.WHITE)
+        black_pawns_bb = board.pieces(chess.PAWN, chess.BLACK)
+        white_pawns = list(white_pawns_bb)
+        black_pawns = list(black_pawns_bb)
+        all_pawns = white_pawns_bb | black_pawns_bb
+        white_bishops = board.pieces(chess.BISHOP, chess.WHITE)
+        black_bishops = board.pieces(chess.BISHOP, chess.BLACK)
  
         # Bishop pair (bonus grows with board openness)
         open_files = sum(1 for f in range(8)
-                         if not (board.pieces(chess.PAWN, chess.WHITE) | board.pieces(chess.PAWN, chess.BLACK)) & chess.BB_FILES[f])
+                 if not all_pawns & chess.BB_FILES[f])
         bp_bonus = 30 + open_files * 3
-        if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += bp_bonus
-        if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= bp_bonus
+        if len(white_bishops) >= 2: score += bp_bonus
+        if len(black_bishops) >= 2: score -= bp_bonus
  
         fast_middlegame_eval = self.eval_mode == "fast" and phase >= 8
 
-        score += self._pawn_structure_score(board, chess.WHITE, phase)
-        score -= self._pawn_structure_score(board, chess.BLACK, phase)
+        score += self._pawn_structure_score(board, chess.WHITE, phase,
+                            pawns=white_pawns,
+                            enemy_pawns=black_pawns)
+        score -= self._pawn_structure_score(board, chess.BLACK, phase,
+                            pawns=black_pawns,
+                            enemy_pawns=white_pawns)
         score += self._rook_file_score(board, chess.WHITE)
         score -= self._rook_file_score(board, chess.BLACK)
         score += self._knight_outpost_score(board, chess.WHITE)
@@ -991,11 +1155,17 @@ class Engine:
         return base_score + dynamic
  
     def _eval_stm(self, board: chess.Board) -> int:
-        raw = self.evaluate_white(board)
+        key = self._tt_key(board)
+        raw = self.eval_cache.get(key)
+        if raw is None:
+            raw = self.evaluate_white(board)
+            if len(self.eval_cache) >= self.max_eval_cache_entries:
+                self.eval_cache.clear()
+            self.eval_cache[key] = raw
         stm_raw = raw if board.turn == chess.WHITE else -raw
  
         # Apply correction history
-        ck = (board.turn, chess.polyglot.zobrist_hash(board) & 0xFFFF)
+        ck = (board.turn, key & 0xFFFF)
         corr = self.corr_hist.get(ck, 0)
         return stm_raw + corr // 8
  
@@ -1073,6 +1243,36 @@ class Engine:
         if board.is_en_passant(move): return PIECE_VALUES[chess.PAWN]
         v = board.piece_at(move.to_square)
         return PIECE_VALUES[v.piece_type] if v else 0
+
+    def _is_capture_cached(self, board: chess.Board, move: chess.Move,
+                           cache: Optional[Dict[chess.Move, bool]] = None) -> bool:
+        if cache is None:
+            return board.is_capture(move)
+        if move in cache:
+            return cache[move]
+        val = board.is_capture(move)
+        cache[move] = val
+        return val
+
+    def _gives_check_cached(self, board: chess.Board, move: chess.Move,
+                            cache: Optional[Dict[chess.Move, bool]] = None) -> bool:
+        if cache is None:
+            return board.gives_check(move)
+        if move in cache:
+            return cache[move]
+        val = board.gives_check(move)
+        cache[move] = val
+        return val
+
+    def _captured_value_cached(self, board: chess.Board, move: chess.Move,
+                               cache: Optional[Dict[chess.Move, int]] = None) -> int:
+        if cache is None:
+            return self._captured_value(board, move)
+        if move in cache:
+            return cache[move]
+        val = self._captured_value(board, move)
+        cache[move] = val
+        return val
  
     def _can_use_null_move(self, board, depth, in_check, allow_null, static_eval, beta):
         if not allow_null or in_check or depth < 3:
@@ -1094,17 +1294,57 @@ class Engine:
         return True
  
     # ── Move ordering ─────────────────────────────────────────────────
+    def _quiet_move_score(self, board: chess.Board, move: chess.Move,
+                          ply: int, prev_move: Optional[chess.Move]) -> int:
+        s = 0
+
+        if ply < MAX_PLY:
+            k0, k1 = self.killers[ply]
+            if k0 and move == k0:
+                s += 3_200_000
+            elif k1 and move == k1:
+                s += 2_700_000
+
+            if ply > 0:
+                pk0, pk1 = self.killers[ply - 1]
+                if pk0 and move == pk0:
+                    s += 900_000
+                elif pk1 and move == pk1:
+                    s += 700_000
+
+        if prev_move:
+            cm = self.counter.get((prev_move.from_square, prev_move.to_square))
+            if cm and cm == move:
+                s += 2_000_000
+            if move.to_square == prev_move.to_square:
+                s += 950_000
+
+        h = self.history.get((board.turn, move.from_square, move.to_square), 0)
+        s += min(1_600_000, h) // 8
+
+        if prev_move:
+            ch = self.cont_hist.get(
+                (prev_move.from_square, prev_move.to_square,
+                 board.turn, move.from_square, move.to_square), 0)
+            s += min(600_000, ch) // 8
+
+        return s
+
     def _move_score(self, board: chess.Board, move: chess.Move,
-                    tt_move, ply: int, prev_move: Optional[chess.Move]) -> int:
+                    tt_move, ply: int, prev_move: Optional[chess.Move],
+                    capture_cache: Optional[Dict[chess.Move, bool]] = None,
+                    check_cache: Optional[Dict[chess.Move, bool]] = None,
+                    captured_value_cache: Optional[Dict[chess.Move, int]] = None) -> int:
         if tt_move and move == tt_move:
             return 12_000_000
- 
-        gives_check = board.gives_check(move)
- 
-        if board.is_capture(move):
+
+        gives_check = self._gives_check_cached(board, move, check_cache)
+        is_capture = self._is_capture_cached(board, move, capture_cache)
+
+        if is_capture:
             atk  = board.piece_at(move.from_square)
             av   = PIECE_VALUES[atk.piece_type] if atk else PIECE_VALUES[chess.PAWN]
-            vv   = self._captured_value(board, move)
+            vv   = self._captured_value_cached(board, move, captured_value_cache)
             base = 6_000_000 + vv * 32 - av * 8 + vv * 8
             if gives_check:  base += 150_000
             if move.promotion: base += PIECE_VALUES.get(move.promotion, 0)
@@ -1113,44 +1353,92 @@ class Engine:
         if move.promotion:
             return 5_000_000 + PIECE_VALUES.get(move.promotion, 0)
  
-        s = 0
+        s = self._quiet_move_score(board, move, ply, prev_move)
         if gives_check:
             s += 1_200_000
- 
-        if ply < MAX_PLY:
-            k0, k1 = self.killers[ply]
-            if k0 and move == k0:   s += 3_200_000
-            elif k1 and move == k1: s += 2_700_000
-            if ply > 0:
-                pk0, pk1 = self.killers[ply - 1]
-                if pk0 and move == pk0:   s += 900_000
-                elif pk1 and move == pk1: s += 700_000
- 
-        if prev_move:
-            cm = self.counter.get((prev_move.from_square, prev_move.to_square))
-            if cm and cm == move:           s += 2_000_000
-            if move.to_square == prev_move.to_square: s += 950_000
- 
-        h  = self.history.get((board.turn, move.from_square, move.to_square), 0)
-        s += min(1_600_000, h) // 8
- 
-        if prev_move:
-            ch = self.cont_hist.get(
-                (prev_move.from_square, prev_move.to_square,
-                 board.turn, move.from_square, move.to_square), 0)
-            s += min(600_000, ch) // 8
- 
         return s
  
-    def _ordered_moves(self, board, moves, tt_move, ply,
-                       captures_only=False, prev_move=None):
+    def _ordered_moves(self, board: chess.Board,
+                       moves: List[chess.Move],
+                       tt_move: Optional[chess.Move],
+                       ply: int,
+                       captures_only: bool = False,
+                       prev_move: Optional[chess.Move] = None,
+                       pv_node: bool = False,
+                       full_sort: bool = False,
+                       capture_cache: Optional[Dict[chess.Move, bool]] = None,
+                       check_cache: Optional[Dict[chess.Move, bool]] = None,
+                       captured_value_cache: Optional[Dict[chess.Move, int]] = None) -> List[chess.Move]:
         if captures_only:
-            moves = [m for m in moves if board.is_capture(m) or m.promotion]
-        if len(moves) <= 1:
+            moves = [m for m in moves
+                     if self._is_capture_cached(board, m, capture_cache) or m.promotion]
+        n_moves = len(moves)
+        if n_moves <= 1:
             return moves
-        return sorted(moves,
-                      key=lambda m: self._move_score(board, m, tt_move, ply, prev_move),
-                      reverse=True)
+
+        score_fn = lambda m: self._move_score(
+            board, m, tt_move, ply, prev_move,
+            capture_cache=capture_cache,
+            check_cache=check_cache,
+            captured_value_cache=captured_value_cache)
+        if full_sort or pv_node or captures_only or n_moves < STAGED_ORDERING_MIN_MOVES:
+            return sorted(moves, key=score_fn, reverse=True)
+
+        lead: List[chess.Move] = []
+        tactical: List[chess.Move] = []
+        quiet: List[chess.Move] = []
+
+        for move in moves:
+            if tt_move and move == tt_move:
+                lead.append(move)
+                continue
+            if (move.promotion
+                    or self._is_capture_cached(board, move, capture_cache)
+                    or self._gives_check_cached(board, move, check_cache)):
+                tactical.append(move)
+            else:
+                quiet.append(move)
+
+        if tactical:
+            tactical.sort(key=score_fn, reverse=True)
+
+        if not quiet:
+            return lead + tactical
+
+        quiet_score = lambda m: self._quiet_move_score(board, m, ply, prev_move)
+        head_count = min(STAGED_QUIET_HEAD, len(quiet))
+        if head_count == len(quiet):
+            quiet_head = sorted(quiet, key=quiet_score, reverse=True)
+            return lead + tactical + quiet_head
+
+        # Keep expensive ordering focused on the first quiet bucket.
+        quiet_head = heapq.nlargest(head_count, quiet, key=quiet_score)
+        quiet_head_set = set(quiet_head)
+        quiet_tail = [m for m in quiet if m not in quiet_head_set]
+        return lead + tactical + quiet_head + quiet_tail
+
+    def _top_ordered_moves(self, board: chess.Board,
+                           moves: List[chess.Move],
+                           tt_move: Optional[chess.Move],
+                           ply: int,
+                           limit: int,
+                           prev_move: Optional[chess.Move] = None,
+                           capture_cache: Optional[Dict[chess.Move, bool]] = None,
+                           check_cache: Optional[Dict[chess.Move, bool]] = None,
+                           captured_value_cache: Optional[Dict[chess.Move, int]] = None) -> List[chess.Move]:
+        if limit <= 0:
+            return []
+        n_moves = len(moves)
+        if n_moves <= 1:
+            return moves[:]
+        score_fn = lambda m: self._move_score(
+            board, m, tt_move, ply, prev_move,
+            capture_cache=capture_cache,
+            check_cache=check_cache,
+            captured_value_cache=captured_value_cache)
+        if n_moves <= limit:
+            return sorted(moves, key=score_fn, reverse=True)
+        return heapq.nlargest(limit, moves, key=score_fn)
  
     # ── Quiescence search ─────────────────────────────────────────────
     def quiescence(self, board: chess.Board, alpha: int, beta: int,
@@ -1166,6 +1454,10 @@ class Engine:
  
         in_check  = board.is_check()
         stand_pat = None
+        capture_cache: Dict[chess.Move, bool] = {}
+        check_cache: Dict[chess.Move, bool] = {}
+        capture_values: Dict[chess.Move, int] = {}
+        see_cache: Dict[chess.Move, int] = {}
  
         if not in_check:
             stand_pat = self._eval_stm(board)
@@ -1173,20 +1465,69 @@ class Engine:
             if stand_pat + 1100 < alpha: return alpha
             if stand_pat > alpha:      alpha = stand_pat
             moves = list(board.generate_legal_captures())
-            if not moves: return alpha
-            # Delta pruning + SEE ordering
-            moves = self._ordered_moves(board, moves, None, ply, prev_move=prev_move)
+
+            filtered = []
+            for move in moves:
+                capture_cache[move] = True
+                cap_val = self._captured_value_cached(board, move, capture_values)
+                if stand_pat + cap_val + QS_DELTA_MARGIN < alpha:
+                    continue
+                filtered.append(move)
+
+            quiet_checks: List[chess.Move] = []
+            can_probe_checks = (
+                qs_depth < QS_CHECK_PLY_LIMIT
+                and stand_pat + QS_CHECK_MARGIN >= alpha
+            )
+            if can_probe_checks:
+                for move in board.legal_moves:
+                    if move.promotion:
+                        continue
+                    if self._is_capture_cached(board, move, capture_cache):
+                        continue
+                    if self._gives_check_cached(board, move, check_cache):
+                        quiet_checks.append(move)
+                if len(quiet_checks) > QS_CHECK_MAX_MOVES:
+                    quiet_checks = self._top_ordered_moves(
+                        board, quiet_checks, None, ply, QS_CHECK_MAX_MOVES,
+                        prev_move=prev_move,
+                        capture_cache=capture_cache,
+                        check_cache=check_cache,
+                        captured_value_cache=capture_values)
+
+            if filtered:
+                # Delta-pruned captures first, then a tiny tail of checking non-captures.
+                ordered_caps = self._ordered_moves(
+                    board, filtered, None, ply,
+                    prev_move=prev_move,
+                    full_sort=True,
+                    capture_cache=capture_cache,
+                    check_cache=check_cache,
+                    captured_value_cache=capture_values)
+                moves = ordered_caps + quiet_checks
+            else:
+                if not quiet_checks:
+                    return alpha
+                moves = quiet_checks
         else:
             moves = list(board.legal_moves)
             if not moves: return -MATE_SCORE + ply
-            moves = self._ordered_moves(board, moves, None, ply, prev_move=prev_move)
+            moves = self._ordered_moves(board, moves, None, ply,
+                                        prev_move=prev_move,
+                                        full_sort=True,
+                                        capture_cache=capture_cache,
+                                        check_cache=check_cache,
+                                        captured_value_cache=capture_values)
  
         for move in moves:
-            is_cap = board.is_capture(move)
+            is_cap = self._is_capture_cached(board, move, capture_cache)
             if stand_pat is not None and is_cap:
-                if move.promotion is None and self._see(board, move) < -100:
+                if move.promotion is None and self._see_cached(board, move, see_cache) < QS_SEE_FLOOR:
                     continue
-                if stand_pat + self._captured_value(board, move) + 280 < alpha:
+                cap_val = capture_values.get(move)
+                if cap_val is None:
+                    cap_val = self._captured_value_cached(board, move, capture_values)
+                if stand_pat + cap_val + QS_DELTA_MARGIN < alpha:
                     continue
  
             board.push(move)
@@ -1253,6 +1594,11 @@ class Engine:
                 return tb_score
  
         static_eval = self._eval_stm(board) if not in_check else -INF
+        capture_cache: Dict[chess.Move, bool] = {}
+        check_cache: Dict[chess.Move, bool] = {}
+        captured_value_cache: Dict[chess.Move, int] = {}
+        see_cache: Dict[chess.Move, int] = {}
+        prev_was_capture = prev_move is not None and board.is_capture(prev_move)
  
         # ── Razoring ──────────────────────────────────────────────────
         if (not pv_node and not in_check and depth <= 2 and tt_move is None
@@ -1291,10 +1637,23 @@ class Engine:
         if (not pv_node and depth >= 7 and not in_check and abs(beta) < MATE_BOUND):
             pc_beta  = beta + 180
             pc_depth = depth - 4
-            caps = [m for m in board.legal_moves if board.is_capture(m)]
-            for m in self._ordered_moves(board, caps, tt_move, ply, prev_move=prev_move)[:min(6, len(caps))]:
-                if self._see(board, m) < 0: continue
-                if self._captured_value(board, m) + static_eval < pc_beta: continue
+            caps = []
+            for m in board.generate_legal_captures():
+                capture_cache[m] = True
+                if self._captured_value_cached(board, m, captured_value_cache) + static_eval >= pc_beta:
+                    caps.append(m)
+            if caps:
+                top_caps = self._top_ordered_moves(
+                    board, caps, tt_move, ply, PROBCUT_CANDIDATE_LIMIT,
+                    prev_move=prev_move,
+                    capture_cache=capture_cache,
+                    check_cache=check_cache,
+                    captured_value_cache=captured_value_cache)
+            else:
+                top_caps = []
+
+            for m in top_caps:
+                if self._see_cached(board, m, see_cache) < 0: continue
                 board.push(m)
                 try:
                     sc = -self.search(board, pc_depth, -pc_beta, -pc_beta+1, ply+1, False, m)
@@ -1316,7 +1675,17 @@ class Engine:
             self._store_tt(key, depth, terminal, TT_EXACT, None, ply)
             return terminal
  
-        ordered = self._ordered_moves(board, moves, tt_move, ply, prev_move=prev_move)
+        ordered = self._ordered_moves(board, moves, tt_move, ply,
+                          prev_move=prev_move,
+                          pv_node=pv_node,
+                          capture_cache=capture_cache,
+                          check_cache=check_cache,
+                          captured_value_cache=captured_value_cache)
+
+        side_to_move = board.turn
+        single_evasion = in_check and len(moves) == 1
+        threat_eval_done = False
+        threat_extension_active = False
  
         best_score = -INF
         best_move  = None
@@ -1324,17 +1693,16 @@ class Engine:
         fail_highs = 0
  
         for move in ordered:
-            is_cap      = board.is_capture(move)
+            is_cap      = self._is_capture_cached(board, move, capture_cache)
             is_promo    = move.promotion is not None
-            gives_chk   = board.gives_check(move)
+            gives_chk   = self._gives_check_cached(board, move, check_cache)
             is_tactical = is_cap or gives_chk or is_promo
-            mover       = board.turn
  
             # ── Extensions ──────────────────────────────────────────
             ext = 0
  
             # Single evasion
-            if in_check and len(moves) == 1:
+            if single_evasion:
                 ext = 1
  
             # Passed pawn push to rank 6/7
@@ -1347,13 +1715,16 @@ class Engine:
                         ext = 1
  
             # Recapture
-            if not ext and is_cap and prev_move and board.is_capture(prev_move):
+            if not ext and is_cap and prev_move and prev_was_capture:
                 if move.to_square == prev_move.to_square:
                     ext = 1
  
             # Threat extension: opponent has hanging strong piece
             if not ext and not is_cap and ply <= 4:
-                if self._hanging_pieces_score(board, not board.turn) < -200:
+                if not threat_eval_done:
+                    threat_eval_done = True
+                    threat_extension_active = self._hanging_pieces_score(board, not side_to_move) < -200
+                if threat_extension_active:
                     ext = 1
  
             # Singular extension
@@ -1366,7 +1737,11 @@ class Engine:
                 excl_moves = [m for m in moves if m != move]
                 if excl_moves:
                     best_excl = -INF
-                    for em in self._ordered_moves(board, excl_moves, None, ply)[:8]:
+                    for em in self._top_ordered_moves(
+                            board, excl_moves, None, ply, SINGULAR_EXCLUDE_LIMIT,
+                            capture_cache=capture_cache,
+                            check_cache=check_cache,
+                            captured_value_cache=captured_value_cache):
                         board.push(em)
                         try:
                             sc = -self.search(board, s_depth, -s_beta-1, -s_beta, ply+1, False, em)
@@ -1398,7 +1773,7 @@ class Engine:
             # ── SEE-based capture pruning ────────────────────────────
             if (not pv_node and is_cap and not gives_chk
                     and move_count > 0 and depth <= 10):
-                see = self._see(board, move)
+                see = self._see_cached(board, move, see_cache)
                 threshold = -72 - 22 * depth
                 if see < threshold:
                     move_count += 1
@@ -1421,7 +1796,7 @@ class Engine:
                         reduction = max(0, min(reduction, max(0, new_depth - 2)))
                         if depth <= 4:
                             reduction = min(reduction, 1)
-                        h = self.history.get((mover, move.from_square, move.to_square), 0)
+                        h = self.history.get((side_to_move, move.from_square, move.to_square), 0)
                         if h > 280_000:  reduction = max(0, reduction - 2)
                         elif h < -60_000: reduction = min(new_depth - 1, reduction + 1)
                         if pv_node:      reduction = max(0, reduction - 1)
@@ -1487,7 +1862,8 @@ class Engine:
         if pv_hint and pv_hint in board.legal_moves:
             tt_move = pv_hint
  
-        moves   = self._ordered_moves(board, list(board.legal_moves), tt_move, 0)
+        moves   = self._ordered_moves(board, list(board.legal_moves), tt_move, 0,
+                          full_sort=True)
         if not moves: return None, 0
  
         best_move:  Optional[chess.Move] = None
@@ -1545,15 +1921,16 @@ class Engine:
         key      = self._tt_key(board)
         tt_entry = self.tt.get(key)
         tt_move  = tt_entry.move if tt_entry else best_move
-        ordered  = self._ordered_moves(board, list(board.legal_moves), tt_move, 0)
+        ordered  = self._top_ordered_moves(
+            board, list(board.legal_moves), tt_move, 0, ROOT_SAFETY_CANDIDATES)
         if not ordered: return best_move, best_score
  
-        candidates = ordered[:8]
+        candidates = ordered
         if best_move not in candidates:
-            candidates = [best_move] + candidates[:7]
+            candidates = [best_move] + candidates[: max(0, ROOT_SAFETY_CANDIDATES - 1)]
  
         verify_depth = max(2, min(6, depth - 1))
-        scored: List[Tuple[chess.Move, int]] = []
+        scored: List[Tuple[chess.Move, int, int]] = []
         for mv in candidates:
             if self.deadline is not None and time.time() >= self.deadline - 0.04:
                 break
@@ -1561,22 +1938,35 @@ class Engine:
             board.push(mv)
             timed_out = False
             try:
+                tactical_penalty = self._root_tactical_penalty(board)
                 sc = -self.search(board, verify_depth - 1, -INF, INF, 1, True, mv)
             except SearchTimeout:
                 timed_out = True
             finally:
                 board.pop()
             if timed_out: break
-            scored.append((mv, sc))
+            scored.append((mv, sc, tactical_penalty))
  
         if len(scored) < 2: return best_move, best_score
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top_move, top_score  = scored[0]
-        chosen_score = next((sc for mv, sc in scored if mv == best_move), best_score)
-        if top_move != best_move and top_score - chosen_score >= 65:
+        scored.sort(key=lambda x: (x[1] - x[2], x[1]), reverse=True)
+        top_move, top_score, top_penalty = scored[0]
+        chosen_score = best_score
+        chosen_penalty = 0
+        for mv, sc, penalty in scored:
+            if mv == best_move:
+                chosen_score = sc
+                chosen_penalty = penalty
+                break
+
+        top_adjusted = top_score - top_penalty
+        chosen_adjusted = chosen_score - chosen_penalty
+
+        severe_risk = chosen_penalty >= 10_000 and top_penalty < 10_000
+        if top_move != best_move and (severe_risk or (top_adjusted - chosen_adjusted >= ROOT_SAFETY_SWITCH_MARGIN)):
             if verbose:
                 print(f"  safety | {best_move.uci()} → {top_move.uci()}"
-                      f" | Δ{top_score - chosen_score:+d} | d{verify_depth}")
+                      f" | Δadj{top_adjusted - chosen_adjusted:+d}"
+                      f" | pen {chosen_penalty}->{top_penalty} | d{verify_depth}")
             return top_move, top_score
         return best_move, best_score
  
@@ -1656,7 +2046,6 @@ class Engine:
         root_moves = list(board.legal_moves)
         if not root_moves:
             return None
-        fallback_root = root_moves[0]
  
         for depth in range(1, max_depth + 1):
             if self.deadline and time.time() >= self.deadline: break
@@ -1703,8 +2092,22 @@ class Engine:
                 best_move, best_score = self._blunder_check_root(
                     board, best_move, best_score, reached_depth, verbose)
 
-        if best_move is None and fallback_root in board.legal_moves:
-            best_move = fallback_root
+        if best_move is not None and best_move in board.legal_moves:
+            board.push(best_move)
+            try:
+                final_penalty = self._root_tactical_penalty(board)
+            finally:
+                board.pop()
+
+            if final_penalty >= ROOT_EMERGENCY_PENALTY:
+                emergency = self._pick_emergency_root_move(board)
+                if emergency and emergency in board.legal_moves and emergency != best_move:
+                    if verbose:
+                        print(f"  safety | tactical emergency: {best_move.uci()} → {emergency.uci()}")
+                    best_move = emergency
+
+        if best_move is None:
+            best_move = self._pick_emergency_root_move(board)
  
         return best_move
  

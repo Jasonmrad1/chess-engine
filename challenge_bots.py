@@ -16,9 +16,9 @@ TARGET_BOTS = [
     # "Lynx_BOT",            # ~2700
     # "likeawizard-bot"            # ~2100
     # "maia9"                    # ~2000
-    # "halcyonbot"
+    "halcyonbot"
     # "StrawberryChessDev"
-    "Boosted_Maia_1700"
+    # "Boosted_Maia_1700"
     ]
 
 def challenge(bot_id):

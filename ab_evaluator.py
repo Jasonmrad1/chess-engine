@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import chess
+import chess.engine
 import chess.pgn
 
 
@@ -64,6 +65,35 @@ class MatchSummary:
 class EvaluationResult:
     summary: MatchSummary
     games: list[GameRecord]
+
+
+@dataclass
+class EngineQualitySummary:
+    engine_name: str
+    analyzed_moves: int
+    average_centipawn_loss: float
+    average_accuracy: float
+    inaccuracies: int
+    mistakes: int
+    blunders: int
+
+
+@dataclass
+class StockfishQualityReport:
+    stockfish_path: str
+    depth: int
+    time_per_position_ms: Optional[int]
+    engine_summaries: list[EngineQualitySummary]
+
+
+@dataclass
+class _EngineQualityAccumulator:
+    analyzed_moves: int = 0
+    total_centipawn_loss: float = 0.0
+    total_accuracy: float = 0.0
+    inaccuracies: int = 0
+    mistakes: int = 0
+    blunders: int = 0
 
 
 class EngineAdapter:
@@ -263,6 +293,139 @@ def elo_from_expected_score(expected_score: float) -> float:
     return 400.0 * math.log10(expected_score / (1.0 - expected_score))
 
 
+def _cp_to_win_percent(cp: float) -> float:
+    # Keep the exponent numerically stable for mate-score converted values.
+    clamped_cp = max(-4000.0, min(4000.0, cp))
+    logistic = 2.0 / (1.0 + math.exp(-0.00368208 * clamped_cp)) - 1.0
+    return 50.0 + 50.0 * logistic
+
+
+def _accuracy_from_scores(before_cp: float, after_cp: float) -> float:
+    before_wp = _cp_to_win_percent(before_cp)
+    after_wp = _cp_to_win_percent(after_cp)
+    drop_wp = max(0.0, before_wp - after_wp)
+
+    # Lichess-style move accuracy mapping from win% drop.
+    accuracy = 103.1668 * math.exp(-0.04354 * drop_wp) - 3.1669
+    return max(0.0, min(100.0, accuracy))
+
+
+def _classify_centipawn_loss(cpl: float) -> tuple[int, int, int]:
+    if cpl >= 300.0:
+        return 0, 0, 1
+    if cpl >= 100.0:
+        return 0, 1, 0
+    if cpl >= 50.0:
+        return 1, 0, 0
+    return 0, 0, 0
+
+
+def _build_stockfish_limit(depth: int, time_per_position_ms: Optional[int]) -> chess.engine.Limit:
+    if depth <= 0:
+        raise ValueError("sf-depth must be positive")
+    if time_per_position_ms is not None and time_per_position_ms <= 0:
+        raise ValueError("sf-time-ms must be positive when provided")
+
+    return chess.engine.Limit(
+        depth=depth,
+        time=(time_per_position_ms / 1000.0) if time_per_position_ms is not None else None,
+    )
+
+
+def _analyze_white_cp(
+    stockfish: chess.engine.SimpleEngine,
+    board: chess.Board,
+    limit: chess.engine.Limit,
+) -> Optional[float]:
+    info = stockfish.analyse(board, limit, info=chess.engine.INFO_SCORE)
+    score = info.get("score")
+    if score is None:
+        return None
+    return float(score.white().score(mate_score=10_000))
+
+
+def analyze_games_with_stockfish(
+    games: list[GameRecord],
+    stockfish_path: str,
+    depth: int,
+    time_per_position_ms: Optional[int],
+) -> StockfishQualityReport:
+    limit = _build_stockfish_limit(depth, time_per_position_ms)
+
+    engine_order: list[str] = []
+    totals: dict[str, _EngineQualityAccumulator] = {}
+
+    with chess.engine.SimpleEngine.popen_uci(stockfish_path) as stockfish:
+        for record in games:
+            for name in (record.white_name, record.black_name):
+                if name not in totals:
+                    totals[name] = _EngineQualityAccumulator()
+                    engine_order.append(name)
+
+            board = chess.Board()
+            eval_white_before = _analyze_white_cp(stockfish, board, limit)
+            if eval_white_before is None:
+                continue
+
+            for uci in record.moves_uci:
+                mover_is_white = board.turn == chess.WHITE
+                mover_name = record.white_name if mover_is_white else record.black_name
+                before_cp = eval_white_before if mover_is_white else -eval_white_before
+
+                move = chess.Move.from_uci(uci)
+                if move not in board.legal_moves:
+                    break
+                board.push(move)
+
+                eval_white_after = _analyze_white_cp(stockfish, board, limit)
+                if eval_white_after is None:
+                    break
+
+                after_cp = eval_white_after if mover_is_white else -eval_white_after
+                cpl = max(0.0, before_cp - after_cp)
+                accuracy = _accuracy_from_scores(before_cp, after_cp)
+
+                totals[mover_name].analyzed_moves += 1
+                totals[mover_name].total_centipawn_loss += cpl
+                totals[mover_name].total_accuracy += accuracy
+
+                inaccuracies, mistakes, blunders = _classify_centipawn_loss(cpl)
+                totals[mover_name].inaccuracies += inaccuracies
+                totals[mover_name].mistakes += mistakes
+                totals[mover_name].blunders += blunders
+
+                eval_white_before = eval_white_after
+
+    summaries: list[EngineQualitySummary] = []
+    for name in engine_order:
+        aggregate = totals[name]
+        if aggregate.analyzed_moves == 0:
+            average_cpl = 0.0
+            average_accuracy = 0.0
+        else:
+            average_cpl = aggregate.total_centipawn_loss / aggregate.analyzed_moves
+            average_accuracy = aggregate.total_accuracy / aggregate.analyzed_moves
+
+        summaries.append(
+            EngineQualitySummary(
+                engine_name=name,
+                analyzed_moves=aggregate.analyzed_moves,
+                average_centipawn_loss=average_cpl,
+                average_accuracy=average_accuracy,
+                inaccuracies=aggregate.inaccuracies,
+                mistakes=aggregate.mistakes,
+                blunders=aggregate.blunders,
+            )
+        )
+
+    return StockfishQualityReport(
+        stockfish_path=stockfish_path,
+        depth=depth,
+        time_per_position_ms=time_per_position_ms,
+        engine_summaries=summaries,
+    )
+
+
 def _write_pgn_game(output_handle, record: GameRecord) -> None:
     game = chess.pgn.Game()
     game.headers["Event"] = "Engine A/B Evaluation"
@@ -422,6 +585,26 @@ def print_summary(summary: MatchSummary, engine_a_name: str, engine_b_name: str)
     print(f"Confidence: {summary.confidence}")
 
 
+def print_stockfish_quality_report(report: StockfishQualityReport) -> None:
+    print("\n=== Stockfish Move Quality Summary ===")
+
+    limit_parts = [f"depth={report.depth}"]
+    if report.time_per_position_ms is not None:
+        limit_parts.append(f"time={report.time_per_position_ms}ms")
+
+    print(f"Analyzer: {report.stockfish_path} ({', '.join(limit_parts)})")
+    for summary in report.engine_summaries:
+        print(
+            f"{summary.engine_name}: "
+            f"accuracy {summary.average_accuracy:.2f}% | "
+            f"avg CPL {summary.average_centipawn_loss:.2f} | "
+            f"inaccuracies {summary.inaccuracies} | "
+            f"mistakes {summary.mistakes} | "
+            f"blunders {summary.blunders} | "
+            f"moves {summary.analyzed_moves}"
+        )
+
+
 def _split_spec(spec: str) -> tuple[str, Optional[str]]:
     if ":" not in spec:
         return spec, None
@@ -507,12 +690,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine-b", required=True, help="Engine B import spec (e.g. engine_new:ENGINE)")
     parser.add_argument("--name-a", default="Engine A", help="Display name for Engine A")
     parser.add_argument("--name-b", default="Engine B", help="Display name for Engine B")
-    parser.add_argument("--games", type=int, default=200, help="Total number of games (>=200)")
+    parser.add_argument("--games", type=int, default=200, help="Total number of games (>=20)")
     parser.add_argument("--time-ms", type=int, default=100, help="Fixed time per move in milliseconds")
     parser.add_argument("--seed", type=int, default=None, help="Optional seed for reproducible fallback move ordering")
     parser.add_argument("--log-file", default=None, help="Optional CSV game result log path")
     parser.add_argument("--pgn-file", default=None, help="Optional PGN export path")
     parser.add_argument("--max-plies", type=int, default=512, help="Safety cap on half-moves per game")
+    parser.add_argument(
+        "--stockfish-path",
+        default=None,
+        help="Optional Stockfish executable path for move-quality analysis",
+    )
+    parser.add_argument(
+        "--sf-depth",
+        type=int,
+        default=12,
+        help="Stockfish depth for move-quality analysis",
+    )
+    parser.add_argument(
+        "--sf-time-ms",
+        type=int,
+        default=None,
+        help="Optional Stockfish analysis time per position in milliseconds",
+    )
     parser.add_argument("--quiet", action="store_true", help="Disable periodic progress output")
     return parser.parse_args()
 
@@ -542,6 +742,18 @@ def main() -> None:
     )
 
     print_summary(result.summary, args.name_a, args.name_b)
+
+    if args.stockfish_path:
+        try:
+            quality_report = analyze_games_with_stockfish(
+                games=result.games,
+                stockfish_path=args.stockfish_path,
+                depth=args.sf_depth,
+                time_per_position_ms=args.sf_time_ms,
+            )
+            print_stockfish_quality_report(quality_report)
+        except Exception as exc:
+            print(f"Stockfish quality analysis skipped: {exc}")
 
     if config.result_log_path is not None:
         print(f"Game result log written to: {config.result_log_path}")
