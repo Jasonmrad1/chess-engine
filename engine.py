@@ -300,6 +300,9 @@ SEE_VALS = [0, 100, 300, 300, 500, 950, 20000, 0]
 ROOT_SAFETY_CANDIDATES = 12
 ROOT_SAFETY_SWITCH_MARGIN = 70
 ROOT_EMERGENCY_PENALTY = 220
+ROOT_SAFETY_PENALTY_GAP = 120
+ROOT_SAFETY_PENALTY_SLACK = 40
+ROOT_FORCED_MATE2_PENALTY = 9_000
 
 # Search speed tuning
 EVAL_CACHE_MAX_ENTRIES = 200_000
@@ -341,6 +344,8 @@ def _build_book():
         # ── Ruy Lopez ─────────────────────────────────────────────────
         ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6","e1g1","f8e7","f1e1","b7b5","a4b3","d7d6","c2c3","e8g8","h2h3","c6a5","b3c2","c7c5","d2d4","d8c7","b1d2"],
         ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6","e1g1","f8e7","f1e1","b7b5","a4b3","e8g8","c2c3","d7d6","h2h3"],
+        ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6","e1g1","b7b5","a4b3","f8e7","a2a4","b5b4","d2d3","e8g8","a4a5","d7d6","c2c3","c8g4"],
+        ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6","e1g1","b7b5","a4b3","f8e7","a2a4","b5b4","d2d3","d7d6","a4a5","e8g8","c2c3","c8g4"],
         ["e2e4","e7e5","g1f3","b8c6","f1b5","g8f6","e1g1","f6e4","d2d4","f8e7","d1e2","e4d6","b5c6","b7c6","d4e5","d6b7","b1c3","e8g8","f3d4"],
         ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6","e1g1","f8e7","f1e1","b7b5","a4b3","e8g8","c2c3","d7d5"],
         ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5c6","d7c6","d2d4","e5d4","d1d4","d8d4","f3d4"],
@@ -378,6 +383,8 @@ def _build_book():
         ["e2e4","c7c6","d2d4","d7d5","b1c3","d5e4","c3e4","b8d7","g1f3","g8f6","e4f6","d7f6","f1d3","c8g4","e1g1","e7e6","c2c3","f8d6"],
         ["e2e4","c7c6","d2d4","d7d5","e4d5","c6d5","c2c4","g8f6","b1c3","e7e6","g1f3","f8e7","c4d5","f6d5","f1d3","d5c3","b2c3","e8g8","e1g1"],
         ["e2e4","c7c6","d2d4","d7d5","b1d2","d5e4","d2e4","b8d7","e4f3","g8f6","f3g3","e7e6","c1f4","f8d6","f4d6","d8d6","f1b5"],
+        ["e2e4","c7c6","g1f3","g8f6","b1c3","d7d5","e4e5","f6e4","c3e4","d5e4","f3g5","c8f5","f1c4","e7e6","d2d3","e4d3","c4d3"],
+        ["e2e4","c7c6","g1f3","d7d5","b1c3","g8f6","e4e5","f6e4","c3e4","d5e4","f3g5","c8f5","f1c4","e7e6","d2d3","e4d3","c4d3"],
         # ── Pirc / Modern ─────────────────────────────────────────────
         ["e2e4","d7d6","d2d4","g8f6","b1c3","g7g6","f2f4","f8g7","g1f3","e8g8","f1e2","c7c5","d4d5","e7e6","e1g1","e6d5","e4d5"],
         ["e2e4","g7g6","d2d4","f8g7","b1c3","d7d6","f1e2","c7c6","g1f3","d8c7","e1g1","b8d7","a2a4"],
@@ -688,14 +695,72 @@ class Engine:
                 board.pop()
         return False
 
+    def _allows_forced_mate_in_two_for_side_to_move(self, board: chess.Board) -> bool:
+        """
+        Detect a simple forced mate-in-two pattern for the side to move:
+        a checking move such that every legal reply allows mate in one.
+        """
+        if self.deadline is not None and time.time() >= self.deadline - 0.01:
+            return False
+
+        checking_moves: List[chess.Move] = []
+        for mv in board.legal_moves:
+            if board.gives_check(mv):
+                checking_moves.append(mv)
+
+        for move in checking_moves:
+            if self.deadline is not None and time.time() >= self.deadline - 0.01:
+                return False
+
+            board.push(move)
+            try:
+                if board.is_checkmate():
+                    return True
+
+                replies = list(board.legal_moves)
+                if not replies:
+                    continue
+
+                forced = True
+                for reply in replies:
+                    board.push(reply)
+                    try:
+                        if not self._allows_mate_in_one_for_side_to_move(board):
+                            forced = False
+                            break
+                    finally:
+                        board.pop()
+
+                    if self.deadline is not None and time.time() >= self.deadline - 0.01:
+                        return False
+
+                if forced:
+                    return True
+            finally:
+                board.pop()
+
+        return False
+
+    def _catastrophic_reply_penalty(self, board: chess.Board) -> int:
+        """
+        Expects `board` with opponent to move after our candidate root move.
+        Returns a large penalty for near-forced mating threats.
+        """
+        if self._allows_mate_in_one_for_side_to_move(board):
+            return 10_000
+        if self._allows_forced_mate_in_two_for_side_to_move(board):
+            return ROOT_FORCED_MATE2_PENALTY
+        return 0
+
     def _root_tactical_penalty(self, board: chess.Board) -> int:
         """
         Estimate immediate tactical danger after our root move.
 
         Expects `board` with opponent to move.
         """
-        if self._allows_mate_in_one_for_side_to_move(board):
-            return 10_000
+        catastrophic = self._catastrophic_reply_penalty(board)
+        if catastrophic > 0:
+            return catastrophic
 
         best_opp_threat = 0
         victim_king = board.king(not board.turn)
@@ -1273,7 +1338,7 @@ class Engine:
         val = self._captured_value(board, move)
         cache[move] = val
         return val
- 
+
     def _can_use_null_move(self, board, depth, in_check, allow_null, static_eval, beta):
         if not allow_null or in_check or depth < 3:
             return False
@@ -1292,11 +1357,13 @@ class Engine:
         if own_pawns >= 3 and total_np <= 2:
             return False
         return True
- 
+
     # ── Move ordering ─────────────────────────────────────────────────
     def _quiet_move_score(self, board: chess.Board, move: chess.Move,
                           ply: int, prev_move: Optional[chess.Move]) -> int:
         s = 0
+        mover = board.piece_at(move.from_square)
+        enemy = not board.turn
 
         if ply < MAX_PLY:
             k0, k1 = self.killers[ply]
@@ -1327,6 +1394,16 @@ class Engine:
                 (prev_move.from_square, prev_move.to_square,
                  board.turn, move.from_square, move.to_square), 0)
             s += min(600_000, ch) // 8
+
+        # Defensive quiet evasions are often critical and can be missed if
+        # they are ordered too late among non-captures.
+        if mover and mover.piece_type != chess.KING:
+            from_attacked = board.is_attacked_by(enemy, move.from_square)
+            to_attacked = board.is_attacked_by(enemy, move.to_square)
+            if from_attacked and not to_attacked:
+                s += 1_050_000 + PIECE_VALUES[mover.piece_type] * 80
+            elif not from_attacked and to_attacked:
+                s -= 380_000
 
         return s
 
@@ -1697,6 +1774,11 @@ class Engine:
             is_promo    = move.promotion is not None
             gives_chk   = self._gives_check_cached(board, move, check_cache)
             is_tactical = is_cap or gives_chk or is_promo
+            quiet_evasion = (
+                (not is_tactical)
+                and board.is_attacked_by(not side_to_move, move.from_square)
+                and (not board.is_attacked_by(not side_to_move, move.to_square))
+            )
  
             # ── Extensions ──────────────────────────────────────────
             ext = 0
@@ -1756,6 +1838,7 @@ class Engine:
  
             # ── Futility pruning ─────────────────────────────────────
             if (not pv_node and not in_check and not is_tactical and not ext
+                    and not quiet_evasion
                     and new_depth <= 4 and move_count > 0
                     and abs(alpha) < MATE_BOUND):
                 if static_eval + FUTILITY_MARGINS[new_depth] <= alpha:
@@ -1764,6 +1847,7 @@ class Engine:
  
             # ── Late-move pruning ────────────────────────────────────
             if (not pv_node and not in_check and not is_tactical and not ext
+                    and not quiet_evasion
                     and depth <= 5
                     and move_count >= (9 + 2 * depth * depth)
                     and static_eval + 95 * depth <= alpha):
@@ -1796,6 +1880,8 @@ class Engine:
                         reduction = max(0, min(reduction, max(0, new_depth - 2)))
                         if depth <= 4:
                             reduction = min(reduction, 1)
+                        if quiet_evasion:
+                            reduction = max(0, reduction - 2)
                         h = self.history.get((side_to_move, move.from_square, move.to_square), 0)
                         if h > 280_000:  reduction = max(0, reduction - 2)
                         elif h < -60_000: reduction = min(new_depth - 1, reduction + 1)
@@ -1875,6 +1961,11 @@ class Engine:
             is_promo    = move.promotion is not None
             gives_chk   = board.gives_check(move)
             is_tactical = is_cap or gives_chk or is_promo
+            quiet_evasion = (
+                (not is_tactical)
+                and board.is_attacked_by(not board.turn, move.from_square)
+                and (not board.is_attacked_by(not board.turn, move.to_square))
+            )
  
             board.push(move)
             try:
@@ -1885,6 +1976,8 @@ class Engine:
                     if depth >= 5 and idx >= 4 and not is_tactical:
                         reduction = int(0.5 + math.log(depth) * math.log(idx) / 3.0)
                         reduction = min(reduction, max(0, depth-2))
+                        if quiet_evasion:
+                            reduction = max(0, reduction - 2)
                     score = -self.search(board, max(0, depth-1-reduction),
                                          -alpha-1, -alpha, 1, True, move)
                     if reduction and score > alpha:
@@ -1917,24 +2010,26 @@ class Engine:
             return best_move, best_score
         if self.deadline is not None and self.deadline - time.time() <= 0.04:
             return best_move, best_score
- 
+
         key      = self._tt_key(board)
         tt_entry = self.tt.get(key)
         tt_move  = tt_entry.move if tt_entry else best_move
         ordered  = self._top_ordered_moves(
             board, list(board.legal_moves), tt_move, 0, ROOT_SAFETY_CANDIDATES)
-        if not ordered: return best_move, best_score
- 
+        if not ordered:
+            return best_move, best_score
+
         candidates = ordered
         if best_move not in candidates:
             candidates = [best_move] + candidates[: max(0, ROOT_SAFETY_CANDIDATES - 1)]
- 
+
         verify_depth = max(2, min(6, depth - 1))
         scored: List[Tuple[chess.Move, int, int]] = []
         for mv in candidates:
             if self.deadline is not None and time.time() >= self.deadline - 0.04:
                 break
-            if mv not in board.legal_moves: continue
+            if mv not in board.legal_moves:
+                continue
             board.push(mv)
             timed_out = False
             try:
@@ -1944,10 +2039,13 @@ class Engine:
                 timed_out = True
             finally:
                 board.pop()
-            if timed_out: break
+            if timed_out:
+                break
             scored.append((mv, sc, tactical_penalty))
- 
-        if len(scored) < 2: return best_move, best_score
+
+        if len(scored) < 2:
+            return best_move, best_score
+
         scored.sort(key=lambda x: (x[1] - x[2], x[1]), reverse=True)
         top_move, top_score, top_penalty = scored[0]
         chosen_score = best_score
@@ -1961,8 +2059,18 @@ class Engine:
         top_adjusted = top_score - top_penalty
         chosen_adjusted = chosen_score - chosen_penalty
 
-        severe_risk = chosen_penalty >= 10_000 and top_penalty < 10_000
-        if top_move != best_move and (severe_risk or (top_adjusted - chosen_adjusted >= ROOT_SAFETY_SWITCH_MARGIN)):
+        severe_risk = (
+            (chosen_penalty >= 10_000 and top_penalty < 10_000)
+            or (
+                chosen_penalty >= ROOT_EMERGENCY_PENALTY
+                and chosen_penalty >= top_penalty + ROOT_SAFETY_PENALTY_GAP
+                and top_score >= chosen_score - ROOT_SAFETY_PENALTY_SLACK
+            )
+        )
+        mate_preservation = top_score >= MATE_BOUND and chosen_score < MATE_BOUND
+        escape_forced_mate = chosen_score <= -MATE_BOUND and top_score > -MATE_BOUND
+
+        if top_move != best_move and (severe_risk or mate_preservation or escape_forced_mate):
             if verbose:
                 print(f"  safety | {best_move.uci()} → {top_move.uci()}"
                       f" | Δadj{top_adjusted - chosen_adjusted:+d}"
