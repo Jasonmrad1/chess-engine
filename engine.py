@@ -80,7 +80,6 @@ import argparse
 import heapq
 import math
 import os
-import random
 import time
 from dataclasses import dataclass
 from typing import Dict, Hashable, List, Optional, Tuple
@@ -96,6 +95,8 @@ INF         = 10 ** 9
 MATE_SCORE  = 32_000
 MATE_BOUND  = MATE_SCORE - 2_000
 MAX_PLY     = 128
+REPETITION_DRAW_COUNT = 3
+THREEFOLD_MIN_HALFMOVES = 8
  
 TT_EXACT = 0
 TT_LOWER = 1
@@ -311,6 +312,8 @@ STAGED_ORDERING_MIN_MOVES = 10
 STAGED_QUIET_HEAD = 8
 PROBCUT_CANDIDATE_LIMIT = 6
 SINGULAR_EXCLUDE_LIMIT = 8
+MAX_EXTENSION_BUDGET = 2
+BOOK_EVAL_SWITCH_MARGIN = 24
 
 QS_SEE_FLOOR = -100
 QS_DELTA_MARGIN = 280
@@ -353,6 +356,7 @@ def _build_book():
         ["e2e4","e7e5","g1f3","b8c6","f1c4","f8c5","c2c3","g8f6","d2d3","e8g8","e1g1"],
         ["e2e4","e7e5","g1f3","b8c6","f1c4","f8c5","b2b4","c5b4","c2c3","b4a5","d2d4","e5d4","e4e5","d7d5","c4b5","g8e7"],
         ["e2e4","e7e5","g1f3","b8c6","f1c4","f8c5","c2c3","g8f6","d2d4","e5d4","c3d4","c5b4","b1c3","f6e4","e1g1"],
+        ["e2e4","e7e5","g1f3","b8c6","f1c4","f8c5","c2c3","g8f6","d2d4","e5d4","c3d4","c5b4","b1c3","f6e4","e1g1","b4c3","b2c3","d7d5"],
         ["e2e4","e7e5","g1f3","b8c6","f1c4","g8f6","f3g5","d7d5","e4d5","c6a5","c4b5","c7c6","d5c6","b7c6","b5e2","h7h6","g5f3","e5e4"],
         # ── Scotch ───────────────────────────────────────────────────
         ["e2e4","e7e5","g1f3","b8c6","d2d4","e5d4","f3d4","g8f6","d4c6","b7c6","e4e5","d8e7","d1e2","f6d5","c2c4","c8a6","g2g3","g7g6","b2b3"],
@@ -513,6 +517,22 @@ class Engine:
         self._syzygy_path:   Optional[str] = None
         self._syzygy_reader: Optional[chess.syzygy.Tablebase] = None
         self._book_path:     Optional[str] = None
+        self.use_book = True
+
+    def _reset_move_ordering_state(self):
+        self.killers = [[None, None] for _ in range(MAX_PLY)]
+        self.history.clear()
+        self.counter.clear()
+        self.cont_hist.clear()
+        self.corr_hist.clear()
+
+    def clear_tt(self):
+        """Clear transposition/eval caches and transient ordering state."""
+        self.tt.clear()
+        self.eval_cache.clear()
+        self.hanging_cache.clear()
+        self.tt_generation = 0
+        self._reset_move_ordering_state()
  
     # ── External setup ────────────────────────────────────────────────
     def set_hash_size(self, entries: int):
@@ -520,20 +540,94 @@ class Engine:
         self.tt.clear()
         self.eval_cache.clear()
         self.hanging_cache.clear()
+        self.tt_generation = 0
+        self._reset_move_ordering_state()
  
     def set_syzygy_path(self, path: str):
         if path and os.path.isdir(path):
             try:
+                if self._syzygy_reader is not None:
+                    try:
+                        self._syzygy_reader.close()
+                    except Exception:
+                        pass
+
+                # Support two common layouts:
+                # 1) All .rtbw/.rtbz files directly in `path`.
+                # 2) Split subfolders (for example Syzygy345WDL + Syzygy345DTZ).
+                direct_wdl = False
+                direct_dtz = False
+                child_dirs: List[str] = []
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        if entry.is_file():
+                            lname = entry.name.lower()
+                            if lname.endswith(".rtbw"):
+                                direct_wdl = True
+                            elif lname.endswith(".rtbz"):
+                                direct_dtz = True
+                        elif entry.is_dir():
+                            child_dirs.append(entry.path)
+
+                if direct_wdl or direct_dtz:
+                    self._syzygy_reader = chess.syzygy.open_tablebase(path)
+                    self._syzygy_path = path
+                    print(f"[TB] Syzygy tablebases loaded from: {path}")
+                    return
+
+                wdl_dirs: List[str] = []
+                dtz_dirs: List[str] = []
+                for d in child_dirs:
+                    base = os.path.basename(d).lower()
+                    has_wdl = False
+                    has_dtz = False
+                    with os.scandir(d) as sub_entries:
+                        for sub in sub_entries:
+                            if not sub.is_file():
+                                continue
+                            lname = sub.name.lower()
+                            if lname.endswith(".rtbw"):
+                                has_wdl = True
+                            elif lname.endswith(".rtbz"):
+                                has_dtz = True
+                            if has_wdl and has_dtz:
+                                break
+
+                    if has_wdl and ("wdl" in base or not has_dtz):
+                        wdl_dirs.append(d)
+                    if has_dtz and ("dtz" in base or not has_wdl):
+                        dtz_dirs.append(d)
+
+                if wdl_dirs or dtz_dirs:
+                    tb = chess.syzygy.Tablebase()
+                    loaded = 0
+                    for d in wdl_dirs:
+                        loaded += tb.add_directory(d, load_wdl=True, load_dtz=False)
+                    for d in dtz_dirs:
+                        loaded += tb.add_directory(d, load_wdl=False, load_dtz=True)
+                    if loaded <= 0:
+                        tb.close()
+                        raise RuntimeError("No Syzygy files found in split subdirectories")
+                    self._syzygy_reader = tb
+                    self._syzygy_path = path
+                    print(f"[TB] Syzygy split tables loaded: {loaded} files from {path}")
+                    return
+
+                # Fallback: try the given directory directly.
                 self._syzygy_reader = chess.syzygy.open_tablebase(path)
-                self._syzygy_path   = path
+                self._syzygy_path = path
                 print(f"[TB] Syzygy tablebases loaded from: {path}")
             except Exception as e:
+                self._syzygy_reader = None
                 print(f"[TB] Could not open tablebases: {e}")
  
     def set_book_path(self, path: str):
         if path and os.path.isfile(path):
             self._book_path = path
             print(f"[Book] External book: {path}")
+
+    def set_book_enabled(self, enabled: bool):
+        self.use_book = bool(enabled)
 
     def set_eval_mode(self, mode: str):
         normalized = str(mode).strip().lower()
@@ -578,20 +672,27 @@ class Engine:
             board.pop()
  
     def _book_move(self, board: chess.Board) -> Optional[chess.Move]:
+        if not self.use_book:
+            return None
         candidates = self._collect_book_candidates(board)
         if not candidates:
             return None
         book_best, best_weight = candidates[0]
         if len(candidates) == 1:
             return book_best
-        if random.random() < 0.82:
-            return book_best
-        eval_best, eval_best_score, eval_best_w = book_best, -INF, best_weight
+
+        # Deterministic tie-breaker: stick to book weights unless eval sees a
+        # clear tactical/positional gain for another top candidate.
+        book_best_score = self._book_eval_score(board, book_best)
+        eval_best, eval_best_score, eval_best_w = book_best, book_best_score, best_weight
         for move, weight in candidates:
             sc = self._book_eval_score(board, move)
             if sc > eval_best_score or (sc == eval_best_score and weight > eval_best_w):
                 eval_best_score, eval_best_w, eval_best = sc, weight, move
-        return eval_best
+
+        if eval_best != book_best and eval_best_score >= book_best_score + BOOK_EVAL_SWITCH_MARGIN:
+            return eval_best
+        return book_best
  
     # ── Syzygy probe ──────────────────────────────────────────────────
     def _tb_probe_wdl(self, board: chess.Board) -> Optional[int]:
@@ -1228,7 +1329,7 @@ class Engine:
                 self.eval_cache.clear()
             self.eval_cache[key] = raw
         stm_raw = raw if board.turn == chess.WHITE else -raw
- 
+
         # Apply correction history
         ck = (board.turn, key & 0xFFFF)
         corr = self.corr_hist.get(ck, 0)
@@ -1523,19 +1624,19 @@ class Engine:
                    qs_depth: int = 0) -> int:
         self.qnodes += 1
         self._check_timeout()
- 
+
         if board.halfmove_clock >= 100 or board.is_insufficient_material():
             return 0
-        if board.is_repetition(2):
+        if board.halfmove_clock >= THREEFOLD_MIN_HALFMOVES and board.is_repetition(REPETITION_DRAW_COUNT):
             return 0
- 
+
         in_check  = board.is_check()
         stand_pat = None
         capture_cache: Dict[chess.Move, bool] = {}
         check_cache: Dict[chess.Move, bool] = {}
         capture_values: Dict[chess.Move, int] = {}
         see_cache: Dict[chess.Move, int] = {}
- 
+
         if not in_check:
             stand_pat = self._eval_stm(board)
             if stand_pat >= beta:      return beta
@@ -1588,14 +1689,15 @@ class Engine:
                 moves = quiet_checks
         else:
             moves = list(board.legal_moves)
-            if not moves: return -MATE_SCORE + ply
+            if not moves:
+                return -MATE_SCORE + ply
             moves = self._ordered_moves(board, moves, None, ply,
                                         prev_move=prev_move,
                                         full_sort=True,
                                         capture_cache=capture_cache,
                                         check_cache=check_cache,
                                         captured_value_cache=capture_values)
- 
+
         for move in moves:
             is_cap = self._is_capture_cached(board, move, capture_cache)
             if stand_pat is not None and is_cap:
@@ -1606,32 +1708,39 @@ class Engine:
                     cap_val = self._captured_value_cached(board, move, capture_values)
                 if stand_pat + cap_val + QS_DELTA_MARGIN < alpha:
                     continue
- 
+
             board.push(move)
             try:
                 score = -self.quiescence(board, -beta, -alpha, ply+1, move, qs_depth+1)
             finally:
                 board.pop()
- 
-            if score >= beta: return beta
-            if score > alpha: alpha = score
- 
+
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+
         return alpha
  
     # ── Main search ───────────────────────────────────────────────────
     def search(self, board: chess.Board, depth: int,
                alpha: int, beta: int, ply: int,
                allow_null: bool,
-               prev_move: Optional[chess.Move] = None) -> int:
+               prev_move: Optional[chess.Move] = None,
+               extension_budget: int = MAX_EXTENSION_BUDGET,
+               prev_was_capture: bool = False) -> int:
         self.nodes += 1
         self._check_timeout()
+
+        if extension_budget < 0:
+            extension_budget = 0
  
         pv_node  = (beta - alpha > 1)
         in_check = board.is_check()
  
         if board.halfmove_clock >= 100 or board.is_insufficient_material():
             return 0
-        if board.is_repetition(2):
+        if board.halfmove_clock >= THREEFOLD_MIN_HALFMOVES and board.is_repetition(REPETITION_DRAW_COUNT):
             return 0
         if ply >= MAX_PLY - 1:
             return self._eval_stm(board)
@@ -1647,6 +1756,10 @@ class Engine:
         key        = self._tt_key(board)
         tt_entry   = self.tt.get(key)
         tt_move    = tt_entry.move if tt_entry else None
+
+        if tt_entry is not None and (tt_entry.depth < 0 or tt_entry.depth > MAX_PLY + 16):
+            tt_entry = None
+            tt_move = None
  
         if tt_entry and tt_entry.depth >= depth:
             tt_score = self._score_from_tt(tt_entry.score, ply)
@@ -1675,7 +1788,6 @@ class Engine:
         check_cache: Dict[chess.Move, bool] = {}
         captured_value_cache: Dict[chess.Move, int] = {}
         see_cache: Dict[chess.Move, int] = {}
-        prev_was_capture = prev_move is not None and board.is_capture(prev_move)
  
         # ── Razoring ──────────────────────────────────────────────────
         if (not pv_node and not in_check and depth <= 2 and tt_move is None
@@ -1703,7 +1815,10 @@ class Engine:
             r = 3 + depth // 4 + min(3, (static_eval - beta) // 180)
             board.push(chess.Move.null())
             try:
-                score = -self.search(board, depth - 1 - r, -beta, -beta+1, ply+1, False, None)
+                score = -self.search(
+                    board, depth - 1 - r, -beta, -beta+1, ply+1,
+                    False, None, extension_budget=extension_budget,
+                    prev_was_capture=False)
             finally:
                 board.pop()
             if score >= beta and abs(score) < MATE_BOUND:
@@ -1733,7 +1848,10 @@ class Engine:
                 if self._see_cached(board, m, see_cache) < 0: continue
                 board.push(m)
                 try:
-                    sc = -self.search(board, pc_depth, -pc_beta, -pc_beta+1, ply+1, False, m)
+                    sc = -self.search(
+                        board, pc_depth, -pc_beta, -pc_beta+1, ply+1,
+                        False, m, extension_budget=extension_budget,
+                        prev_was_capture=True)
                 finally:
                     board.pop()
                 if sc >= pc_beta:
@@ -1742,7 +1860,10 @@ class Engine:
  
         # ── IID ───────────────────────────────────────────────────────
         if pv_node and depth >= 5 and tt_move is None:
-            self.search(board, depth - 2, alpha, beta, ply, False, prev_move)
+            self.search(
+                board, depth - 2, alpha, beta, ply,
+                False, prev_move, extension_budget=extension_budget,
+                prev_was_capture=prev_was_capture)
             tt_entry = self.tt.get(key)
             tt_move  = tt_entry.move if tt_entry else None
  
@@ -1826,7 +1947,10 @@ class Engine:
                             captured_value_cache=captured_value_cache):
                         board.push(em)
                         try:
-                            sc = -self.search(board, s_depth, -s_beta-1, -s_beta, ply+1, False, em)
+                            sc = -self.search(
+                                board, s_depth, -s_beta-1, -s_beta, ply+1,
+                                False, em, extension_budget=extension_budget,
+                                prev_was_capture=self._is_capture_cached(board, em, capture_cache))
                         finally:
                             board.pop()
                         if sc > best_excl: best_excl = sc
@@ -1834,7 +1958,11 @@ class Engine:
                     if best_excl < s_beta:
                         ext = 1
  
+            if ext > extension_budget:
+                ext = extension_budget
+
             new_depth = depth - 1 + ext
+            child_extension_budget = max(0, extension_budget - ext)
  
             # ── Futility pruning ─────────────────────────────────────
             if (not pv_node and not in_check and not is_tactical and not ext
@@ -1871,7 +1999,10 @@ class Engine:
             board.push(move)
             try:
                 if move_count == 0:
-                    score = -self.search(board, new_depth, -beta, -alpha, ply+1, True, move)
+                    score = -self.search(
+                        board, new_depth, -beta, -alpha, ply+1,
+                        True, move, extension_budget=child_extension_budget,
+                        prev_was_capture=is_cap)
                 else:
                     # LMR
                     reduction = 0
@@ -1887,12 +2018,20 @@ class Engine:
                         elif h < -60_000: reduction = min(new_depth - 1, reduction + 1)
                         if pv_node:      reduction = max(0, reduction - 1)
  
-                    score = -self.search(board, max(0, new_depth - reduction),
-                                         -alpha-1, -alpha, ply+1, True, move)
+                    score = -self.search(
+                        board, max(0, new_depth - reduction), -alpha-1, -alpha,
+                        ply+1, True, move, extension_budget=child_extension_budget,
+                        prev_was_capture=is_cap)
                     if reduction and score > alpha:
-                        score = -self.search(board, new_depth, -alpha-1, -alpha, ply+1, True, move)
+                        score = -self.search(
+                            board, new_depth, -alpha-1, -alpha, ply+1,
+                            True, move, extension_budget=child_extension_budget,
+                            prev_was_capture=is_cap)
                     if alpha < score < beta:
-                        score = -self.search(board, new_depth, -beta, -alpha, ply+1, True, move)
+                        score = -self.search(
+                            board, new_depth, -beta, -alpha, ply+1,
+                            True, move, extension_budget=child_extension_budget,
+                            prev_was_capture=is_cap)
             finally:
                 board.pop()
  
@@ -1945,6 +2084,9 @@ class Engine:
         key       = self._tt_key(board)
         tt_entry  = self.tt.get(key)
         tt_move   = tt_entry.move if tt_entry else None
+        if tt_entry is not None and (tt_entry.depth < 0 or tt_entry.depth > MAX_PLY + 16):
+            tt_entry = None
+            tt_move = None
         if pv_hint and pv_hint in board.legal_moves:
             tt_move = pv_hint
  
@@ -1970,7 +2112,9 @@ class Engine:
             board.push(move)
             try:
                 if idx == 0:
-                    score = -self.search(board, depth-1, -beta, -alpha, 1, True, move)
+                    score = -self.search(
+                        board, depth-1, -beta, -alpha, 1,
+                        True, move, prev_was_capture=is_cap)
                 else:
                     reduction = 0
                     if depth >= 5 and idx >= 4 and not is_tactical:
@@ -1979,11 +2123,16 @@ class Engine:
                         if quiet_evasion:
                             reduction = max(0, reduction - 2)
                     score = -self.search(board, max(0, depth-1-reduction),
-                                         -alpha-1, -alpha, 1, True, move)
+                                         -alpha-1, -alpha, 1, True, move,
+                                         prev_was_capture=is_cap)
                     if reduction and score > alpha:
-                        score = -self.search(board, depth-1, -alpha-1, -alpha, 1, True, move)
+                        score = -self.search(
+                            board, depth-1, -alpha-1, -alpha, 1,
+                            True, move, prev_was_capture=is_cap)
                     if alpha < score < beta:
-                        score = -self.search(board, depth-1, -beta, -alpha, 1, True, move)
+                        score = -self.search(
+                            board, depth-1, -beta, -alpha, 1,
+                            True, move, prev_was_capture=is_cap)
             finally:
                 board.pop()
  
@@ -2030,11 +2179,14 @@ class Engine:
                 break
             if mv not in board.legal_moves:
                 continue
+            mv_is_cap = board.is_capture(mv)
             board.push(mv)
             timed_out = False
             try:
                 tactical_penalty = self._root_tactical_penalty(board)
-                sc = -self.search(board, verify_depth - 1, -INF, INF, 1, True, mv)
+                sc = -self.search(
+                    board, verify_depth - 1, -INF, INF, 1,
+                    True, mv, prev_was_capture=mv_is_cap)
             except SearchTimeout:
                 timed_out = True
             finally:
@@ -2216,7 +2368,7 @@ class Engine:
 
         if best_move is None:
             best_move = self._pick_emergency_root_move(board)
- 
+
         return best_move
  
  

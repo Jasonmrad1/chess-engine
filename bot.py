@@ -103,11 +103,13 @@ class LichessBotRunner:
         *,
         search_verbose: bool = False,
         use_fast_eval_in_complex: bool = True,
+        fixed_depth: Optional[int] = None,
     ):
         self.adapter = adapter
         self.stop_event = threading.Event()
         self.search_verbose = search_verbose
         self.use_fast_eval_in_complex = use_fast_eval_in_complex
+        self.fixed_depth = fixed_depth
  
         self.games: Dict[str, GameContext] = {}
         self.game_threads: Dict[str, threading.Thread] = {}
@@ -410,6 +412,9 @@ class LichessBotRunner:
             piece_count=piece_count,
             legal_count=legal_count,
         )
+
+        if self.fixed_depth is not None:
+            max_depth = max(1, min(64, self.fixed_depth))
  
         # Low-clock hard depth caps
         if remaining <= 2:
@@ -993,6 +998,18 @@ def main():
         action="store_true",
         help="Disable fast eval mode in complex middlegames.",
     )
+    parser.add_argument(
+        "--tb",
+        type=str,
+        default="",
+        help="Path to Syzygy tablebase directory.",
+    )
+    parser.add_argument(
+        "--fixed-depth",
+        type=int,
+        default=0,
+        help="Force a fixed max depth for all moves (0 = dynamic).",
+    )
     args = parser.parse_args()
  
     logging.basicConfig(
@@ -1005,11 +1022,16 @@ def main():
         adapter=adapter,
         search_verbose=args.search_verbose,
         use_fast_eval_in_complex=not args.full_eval_complex,
+        fixed_depth=(args.fixed_depth if args.fixed_depth > 0 else None),
     )
+    if args.tb:
+        engine.ENGINE.set_syzygy_path(args.tb)
     LOGGER.info(
-        "Bot config | search_verbose=%s | fast_eval_in_complex=%s",
+        "Bot config | search_verbose=%s | fast_eval_in_complex=%s | tb=%s | fixed_depth=%s",
         args.search_verbose,
         not args.full_eval_complex,
+        args.tb or "disabled",
+        args.fixed_depth if args.fixed_depth > 0 else "dynamic",
     )
  
     try:
